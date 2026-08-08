@@ -1,0 +1,17 @@
+[package]
+name = "dns-query-blocker-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dns-query-blocker-common = { path = "../dns-query-blocker-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "dns-query-blocker"
+path = "src/main.rs"
