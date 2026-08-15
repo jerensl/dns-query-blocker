@@ -4,7 +4,7 @@
 use aya_ebpf::{bindings::xdp_action, macros::{map, xdp}, maps::HashMap, programs::XdpContext};
 use aya_log_ebpf::info;
 use core::mem;
-use network_types::{eth::{EthHdr, EtherType}, ip::{IpError, IpProto, Ipv4Hdr}, udp::UdpHdr};
+use network_types::{eth::{EthHdr, EtherType}, ip::{IpError, IpProto, Ipv4Hdr, Ipv6Hdr}, udp::UdpHdr};
 
 use dns_query_blocker_common::{djb2_hash_domain, MAX_DOMAIN_LEN};
 
@@ -32,6 +32,43 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
+fn dns_lookup(ctx: &XdpContext) -> Option<u32> {
+    // Ensure at least 12-byte DNS header is present
+    let dns_offset =  EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + 12;
+
+    if ctx.data() + dns_offset > ctx.data_end() {
+        return None;
+    }
+
+    // 4. DNS Header + QNAME Extraction
+    let qname_ptr = ctx.data() + dns_offset;
+    let mut current_ptr = qname_ptr;
+    let mut qname_len = 0;
+
+    for _ in 0..MAX_DOMAIN_LEN {
+        if current_ptr + 1 > ctx.data_end() {
+            break;
+        }
+
+        let byte = unsafe { *(current_ptr as *const u8) };
+        qname_len += 1;
+
+        if byte == 0 {
+            break;
+        }
+
+        current_ptr += 1;
+    }
+
+    let qname_slice = unsafe { 
+        core::slice::from_raw_parts(qname_ptr as *const u8, qname_len) 
+    };
+
+    let hash = djb2_hash_domain(qname_slice);
+
+    Some(hash)
+}
+
 fn try_dns_query_blocker(ctx: XdpContext) -> Result<u32, ()> {
     // 1. Layer 2 (Ethernet)
     let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
@@ -52,38 +89,9 @@ fn try_dns_query_blocker(ctx: XdpContext) -> Result<u32, ()> {
                         return Ok(xdp_action::XDP_PASS)
                     }
 
-                    // Ensure at least 12-byte DNS header is present
-                    let dns_offset =  EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + 12;
-
-                    if ctx.data() + dns_offset > ctx.data_end() {
-                        return Ok(xdp_action::XDP_PASS);
-                    }
-
-                    // 4. DNS Header + QNAME Extraction
-                    let qname_ptr = ctx.data() + dns_offset;
-                    let mut current_ptr = qname_ptr;
-                    let mut qname_len = 0;
-
-                    for _ in 0..MAX_DOMAIN_LEN {
-                        if current_ptr + 1 > ctx.data_end() {
-                            break;
-                        }
-
-                        let byte = unsafe { *(current_ptr as *const u8) };
-                        qname_len += 1;
-
-                        if byte == 0 {
-                            break;
-                        }
-
-                        current_ptr += 1;
-                    }
-
-                    let qname_slice = unsafe { 
-                        core::slice::from_raw_parts(qname_ptr as *const u8, qname_len) 
+                    let Some(hash) = dns_lookup(&ctx) else {
+                        return Ok(xdp_action::XDP_PASS)
                     };
-
-                    let hash = djb2_hash_domain(qname_slice);
 
                     if unsafe { BLOCKLIST.get(&hash) }.is_some() {
                         info!(&ctx, "Dropping DNS query (Hash: {})", hash);
@@ -93,6 +101,35 @@ fn try_dns_query_blocker(ctx: XdpContext) -> Result<u32, ()> {
                 _ => return Ok(xdp_action::XDP_PASS)
             };
         }
+        Ok(EtherType::Ipv6) => {
+            // 2. Layer 3 (IPv4)
+            let ipv6hdr: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+
+            match unsafe { (*ipv6hdr).next_hdr().map_err(|_: IpError| ())? } {
+                IpProto::Tcp => return Ok(xdp_action::XDP_PASS),
+                IpProto::Udp => {
+                    // 3. Layer 4 (UDP)
+                    let udphdr: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv6Hdr::LEN)?;
+
+                    let src_port = u16::from_be_bytes(unsafe {(*udphdr).src});
+
+                    if src_port != 53 {
+                        return Ok(xdp_action::XDP_PASS)
+                    }
+
+                    let Some(hash) = dns_lookup(&ctx) else {
+                        return Ok(xdp_action::XDP_PASS)
+                    };
+
+                    if unsafe { BLOCKLIST.get(&hash) }.is_some() {
+                        info!(&ctx, "Dropping DNS query (Hash: {})", hash);
+                        return Ok(xdp_action::XDP_DROP);
+                    }
+                }
+                _ => return Ok(xdp_action::XDP_PASS)
+            };
+        }
+
         _ => return Ok(xdp_action::XDP_PASS),
     }
 
